@@ -7,6 +7,8 @@ It is DRIVER=6 inside the SymbOS Network Daemon source (GPL-3.0) and also builds
 Status: confirmed working on real MSX Pico+ hardware (SymbOS 4.0, MSX2, Nextor boot with the SD driver,
 1 MB mapper from a PicoVerse 2350). DHCP, DNS, TCP, UDP (SNTP) and HTTPS work.
 
+<img width="2000" height="1500" alt="WhatsApp Image 2026-11-09 at 21 30 14" src="https://github.com/user-attachments/assets/6eea7bcf-5b23-4b28-a5d1-985a57528611" />
+
 ## Build (WinAPE 1.0.13)
 
 | Wrapper | Output | Target |
