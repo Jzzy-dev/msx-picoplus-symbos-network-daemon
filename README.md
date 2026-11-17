@@ -17,7 +17,7 @@ Version 0.8 (branch `ocm-fixes`) carries over the work done for the PicoVerse 23
   `docs/README-ESP-driver.md`.
 Not yet tried on real MSX Pico+ hardware. The version before this one is on `main`.
 
-<img width="2000" height="1500" alt="WhatsApp Image 2026-11-09 at 21 30 14" src="https://github.com/user-attachments/assets/6eea7bcf-5b23-4b28-a5d1-985a57528611" />
+<img width="2000" height="1500" alt="picoplusNetworkDaemonUpd" src="https://github.com/user-attachments/assets/622fd990-df22-4a8e-b245-147b0f85c8f2" />
 
 ## Build (WinAPE 1.0.13)
 
