@@ -2,7 +2,7 @@
 
 Status, working on MSX2 with PicoVerse 2350 (SymbOS 4.0). The daemon finds the card, gets
 the IP settings through DHCP from the ESP, resolves names and moves TCP data. wget and SymTel
-were used successfully. UDP works too (tested with SNTP). Driver version 0.5, shown in the Driver tab as MSX PcVrs ESP v0.5. HTTPS (TLS) is supported through the ESP, see below and the notes there (untested at the time of writing).
+were used successfully. UDP works too (tested with SNTP). Driver version 0.8, shown in the Driver tab as MSX PcVrs ESP v0.8. HTTPS (TLS) is supported through the ESP, see below and the notes there (untested at the time of writing).
 
 ## Build
 Wrapper order, constants file, Dmn-Network-head.asm, Dmn-Network-libs.asm, Dmn-Network.asm
@@ -53,26 +53,83 @@ Tested on real hardware with Net Test (World clock, SNTP).
   closes all transient UDP sockets in the ESP, so a program that was killed cannot block the four ESP
   connections. The ESP has four connections for TCP and UDP together.
 * The answer to UDP_SEND is waited for up to 3 seconds, the ESP can need a while.
-* Largest datagram is 576 bytes, larger ones are refused on send and cut on receive.
+* Largest datagram is 576 bytes by default (UDPMAX), larger ones are refused on send and dropped on receive.
 
-## HTTPS / TLS
-The ESP firmware (BearSSL) can do TLS itself, TCP_OPEN has a flag for it. The SymbOS network API has no
-TLS flag, so the driver decides by port, the program just talks plain data to the daemon.
-* A client connection to port 443, 8443, 465, 993 or 995 is opened as a TLS connection. The list is
-  esp_tlsports in Dmn-Network-ESP.asm. Server connections stay plain.
-* So `http://host:443/` style access works in any program that lets you pick the port, and a program
-  that has its own https support only has to connect to port 443 and send its plain HTTP request.
-* For SNI and the name check the ESP needs the host name, the daemon only has the IP at that point.
-  The driver remembers the last four DNS answers (name and IP) and sends the name that belongs to
-  the IP. A connection by IP number without a previous name lookup has no host name, a lot of servers
-  refuse that.
-* TLSVERIFY in the wrapper. 0 (default) = encrypted, but the server certificate is not checked,
-  so nobody listening along can read the data, but a man in the middle is not noticed. 1 = the ESP
-  checks the certificate against its certificate store (certs.ar in the ESP, flashed with the firmware
-  tools), a connection then fails if the store is missing or the certificate is not known.
+## HTTPS / TLS (changed in version 0.8)
+The ESP firmware (BearSSL) does the TLS itself. Since version 0.8 the program asks for TLS explicitly in
+TCP_Open, the same way as ducasp's OCM daemon does. There is no guessing by port number and no cache of DNS
+names any more. This is not compatible with programs that rely on the old port list, they connect in plain
+text now.
+* A = mode byte. Bit 0 server, bit 1 reserved (must be 0), bit 2 TLS, bit 3 check the certificate and the
+  host name, bits 4 to 7 the bank of the host name.
+* BC = address of the zero terminated host name (SNI and name check), 0 for a plain connection.
+  Plain client A=0, TLS client A=4, TLS with certificate check A=12. A TLS server is not possible, error 3.
+* A missing, empty, unterminated or longer than 255 bytes host name gives error 26.
+* A failed TLS open ends as a closed socket with the close reason 25 (TLS handshake or certificate) and
+  8 for no free session. The reason is returned in H of TCP_Status and in H of the TCP event.
+* The check box "Check HTTPS server certificates" in the ESP8266 tab of the settings (Network settings
+  button) adds the certificate check (bit 3) to every TLS connection, whatever the program asks for. It is
+  saved in network.ini. TLSVERIFY in the wrapper is only the start value. The ESP checks against its
+  certificate store (certs.ar, put there by the certificate update), a connection fails if the store is
+  missing, the certificate is not known or the date of the ESP is wrong.
 * Limits of the ESP: only one TLS connection at a time, TLS 1.2 at most, the handshake takes a few
   seconds, big pages and servers with very large certificate chains can fail on the little RAM.
-  A failed TLS open shows up like any other refused connection.
+
+## Protocol fixes taken from the OCM daemon (version 0.8)
+ducasp found a number of problems in the daemon while working on the OCM WiFi driver, see issue 1 and the
+porting guide. Ported to this driver, the hardware transport and the slot window are untouched.
+* The ESP handles one command at a time. While a TCP open or a DNS request is outstanding the driver
+  refuses every other command at the driver entry points (TCP status, send, receive, close, UDP open, send,
+  close, status), before the slot window is opened. Receive and send return nothing transferred, close returns
+  error 5 and the socket stays, status reports "in process". TCP_Open and UDP_Open are refused before a
+  socket is taken, so none is lost.
+* Close and disconnect ask the driver first and free the socket only when it worked, so a busy close can be
+  repeated. A refused TCP open gives its socket back.
+* A connection that the server closed but that still has data in the ESP keeps showing as established
+  with data until the program has read it, so downloads are not cut short (CLOSE_WAIT and LAST_ACK).
+* The events use the socket that is really being checked, and "Reset all connections" in the menu now closes
+  every socket (it used socket 0 only).
+* UDP_Receive BC contract. BC=0 copies the whole datagram, BC larger than the datagram copies all of it, BC
+  from 1 up to the length copies BC bytes and drops the rest. The datagram is consumed in all cases and BC
+  returns the number of bytes copied. UDP_Status still shows the full length.
+* The largest UDP datagram is UDPMAX in the wrapper, 576 by default. 1468 can be chosen, it costs about
+  1.8 KB more transfer area because the send and the receive buffer are separate in this driver.
+* Not ported. UDP_STATEX (needs a firmware that has function 210, the direct UDP_RCV model is kept, so the
+  socket index problem of that model does not exist here), the ESP hosted IP configuration and the OCM
+  user interface parts.
+
+## Scan tab (version 0.6)
+The status window has a fourth tab, Scan, modelled on the Scan tab that ducasp added to his SM-X daemon.
+* Scan looks for access points (ESP command S, then s until the scan is ready). Up to 10 names are kept,
+  hidden networks and double names are left out, encrypted networks get a * behind the name.
+* Choose a network in the list, type the password (Show password unmasks it) and press Connect.
+  The ESP joins the network (command A, up to about 12 seconds). Open networks need no password.
+* Disconnect makes the ESP leave the access point and forget it (command a).
+* After Connect or Disconnect the daemon goes back to "no IP" and reads the IP data from the ESP again,
+  the line "WiFi: name" at the top shows the access point.
+* S, s, a and g are single byte commands without a length field, A has the normal header. The answer of s has no
+  length field either, it is [s][rc][count] and then name,0,O or E for every network.
+* The ESP stores the credentials in its own flash, the daemon does not save them.
+* The scan code was run in an emulator against a scripted ESP (busy, ready, none, no answer, full table).
+  The window layout itself has not been tried on a real SymbOS yet.
+
+## ESP8266 tab of the settings (version 0.7, file selector and progress window in 0.8)
+Network settings has a third tab, ESP8266.
+* ESP firmware version - read with the V command at the start and after an update.
+* Check HTTPS server certificates - see the TLS notes.
+* Update from a file - press Firmware... (fw8266.bin) or Certificates... (cert8266.bin). The SymbOS file selector opens, pick the file and the update starts at once. The chosen path is
+  shown in the file line. Both files are in the ESPFW folder of ducasp's packs. The daemon reads the file
+  twice (first for the size), starts the update with Z or Y, sends it in blocks of 256 bytes (z, every
+  block is acknowledged), ends it with E and waits until the ESP answers again. After a certificate update
+  it asks the ESP to build the certificate index (I). Updating the firmware erases the certificates, so
+  update them again afterwards.
+* A progress window shows what happens (starting, sent n of m KB, writing, certificate index) with a
+  progress bar. It closes when the update is ready, the result stays in the message line of the tab.
+* A firmware update takes a few minutes. Do not switch off. The ESP cannot abort an update, if a block
+  fails the message says to switch the MSX off and on.
+* The protocol follows CFGESP of ducasp and the ESP firmware source. The update code was tested in an
+  emulator against a scripted ESP (start, blocks, refusal, no answer, restart, certificate index), not
+  yet with a real ESP, and the tab itself has not been tried on a real SymbOS.
 
 ## WiFi state and signal strength
 The ESP firmware has no signal strength command. What it offers is the state of the WiFi connection and the

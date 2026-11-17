@@ -68,6 +68,9 @@ esp_pend        db 0            ;0=idle, else fn of an outstanding request
 esp_pendsck     db 0            ;socket that owns the outstanding request
 esp_conn        ds low_sockmax  ;ESP connection number per daemon socket (0=none)
 esp_stat        ds low_sockmax  ;cached daemon status (for pending open result)
+esp_reason      ds low_sockmax  ;why an open failed per socket, 8 no free session, 25 TLS
+esp_tlsreq      ds low_sockmax  ;4 when the open of that socket asked for TLS
+esp_lastreason  db 0            ;reason of the socket that lowtst checked last
 esp_dnsres      ds 4            ;last DNS result
 esp_dnsst       db 0            ;0=idle,1=pending,2=ok,3=failed
 esp_mac         ds 6            ;pseudo MAC (ESP owns the real one)
@@ -77,7 +80,7 @@ esp_sta_delay   equ 3
 
 ; Everything the code touches while the slot window is open must live in this
 ; file (transfer area, page 3). The daemon data may not be reachable then.
-esp_tmp         ds 8            ;copy of the TCP open parameter block
+esp_tmp         ds 10           ;copy of the TCP open parameter block, flags and host name length are at +8 and +9
 esp_ip4         ds 4            ;IP info answer
 esp_dnsb        ds 64           ;copy of the domain name for a DNS request
 esp_dnsl        dw 0            ;its length
@@ -364,6 +367,7 @@ lowini0 xor a
         ret c
         call espucl0            ;close UDP connections left behind by earlier runs
         call espap              ;read the access point name
+        call espver             ;and the firmware version
         or a
         ret
 
@@ -700,7 +704,7 @@ if ESPDEBUG=1
 endif
         scf
         ret
-espfin6 ld hl,esptxt2         ;found, the adapter line reads Adapter: ESP8266 WiFi
+espfin6 ld hl,esptxt2         ;found, the adapter line reads Adapter ESP8266 WiFi
         call esptext
 if ESPDEBUG=1
         call esplogtx
@@ -850,7 +854,7 @@ lowtop  ld c,a
         push ix
         pop hl                  ;copy the parameter block into the transfer area
         ld de,esp_tmp
-        ld bc,8
+        ld bc,10
         ldir
         pop de                  ;e=mode, still needed below
         push de
@@ -901,6 +905,14 @@ lowtop7 call espleave
         ld hl,esp_stat
         add hl,bc
         ld (hl),0               ;0 = still opening
+        ld hl,esp_reason
+        add hl,bc
+        ld (hl),0
+        ld hl,esp_tlsreq
+        add hl,bc
+        ld a,(esp_tmp+8)
+        and 4
+        ld (hl),a
         or a
         ret
 lowtop9 pop de
@@ -909,112 +921,34 @@ lowtop9 pop de
         scf
         ret
 
-;### ESPTLSD -> decide if this open is TLS and prepare flags and host name
-;### Input      E=mode (bit 0 = server), esp_tmp = parameter block
+;### ESPTLSD -> take the explicit TLS flags and host name from the daemon
+;### Input      esp_tmp = parameter block, (esp_tmp+8)=flags, (esp_tmp+9)=length of the host name
 ;### Output     esp_tlsf = flag bits for the ESP, esp_tlsl = number of host name bytes (0 = plain TCP),
-;###            esp_tlsp = the host name
-;### The ESP firmware (BearSSL) does the TLS work, only one TLS connection at a time. A connection to
-;### one of the ports in esp_tlsports is made a TLS connection, the program talks plain data.
-;### The host name is looked up by IP in the last DNS answers, it is needed for SNI and the name check.
+;###            esp_tlsp = the host name in the transfer area
+;### The program asks for TLS in the mode of TCP_Open, bit 2 TLS and bit 3 check the certificate. The host name
+;### is needed for SNI and the name check. There is no guessing by port number and no DNS name cache.
+;### The setting in the ESP8266 tab of the settings adds the certificate check to every TLS connection.
 esp_tlsf        db 0
 esp_tlsl        dw 0
 esp_tlsp        dw 0
-esp_nohost      db 0
-esp_tlsports    dw 443,8443,465,993,995,0
-esp_hni         db 0
-esp_hn          ds 4*68         ;last 4 DNS answers - IP (4) and name (64)
 
-esptlsd xor a
-        ld (esp_tlsf),a
-        ld hl,0
-        ld (esp_tlsl),hl
-        bit 0,e
-        ret nz                  ;server connections stay plain
-        ld hl,esp_tlsports
-        ld a,(esp_tmp+6)
-        ld c,a
-        ld a,(esp_tmp+7)
+esptlsd ld a,(esp_tmp+8)
+        and #0c
         ld b,a
-esptl0  ld e,(hl)
-        inc hl
-        ld d,(hl)
-        inc hl
-        ld a,d
-        or e
-        ret z                   ;not a TLS port
-        ld a,e
-        cp c
-        jr nz,esptl0
-        ld a,d
-        cp b
-        jr nz,esptl0
-if TLSVERIFY=1
-        ld a,12                 ;TLS and check the certificate
-else
-        ld a,4                  ;TLS, the certificate is not checked
-endif
+        bit 2,b
+        jr z,esptl00
+        ld a,(cfg_tlsver)       ;set in the ESP8266 tab of the settings
+        or a
+        jr z,esptl00
+        set 3,b                 ;check the certificate
+esptl00 ld a,b
         ld (esp_tlsf),a
-        ld hl,esp_nohost        ;without a known name only the terminator is sent
+        ld a,(esp_tmp+9)
+        ld (esp_tlsl+0),a
+        xor a
+        ld (esp_tlsl+1),a
+        ld hl,esp_fwbuf
         ld (esp_tlsp),hl
-        ld hl,1
-        ld (esp_tlsl),hl
-        ld ix,esp_hn
-        ld b,4
-esptl1  ld a,(ix+4)
-        or a
-        jr z,esptl4             ;entry not used
-        ld a,(esp_tmp+2)
-        cp (ix+0)
-        jr nz,esptl4
-        ld a,(esp_tmp+3)
-        cp (ix+1)
-        jr nz,esptl4
-        ld a,(esp_tmp+4)
-        cp (ix+2)
-        jr nz,esptl4
-        ld a,(esp_tmp+5)
-        cp (ix+3)
-        jr nz,esptl4
-        push ix                 ;found, count the name with its terminator
-        pop hl
-        ld de,4
-        add hl,de
-        ld (esp_tlsp),hl
-        ld bc,1
-esptl3  ld a,(hl)
-        or a
-        jr z,esptl5
-        inc hl
-        inc bc
-        jr esptl3
-esptl5  ld (esp_tlsl),bc
-        ret
-esptl4  ld de,68
-        add ix,de
-        djnz esptl1
-        ret
-
-;### ESPHNADD -> remember the name and the IP of the DNS answer that just arrived
-esphnadd ld ix,esp_hn
-        ld a,(esp_hni)
-        or a
-        jr z,esphna2
-        ld b,a
-        ld de,68
-esphna1 add ix,de
-        djnz esphna1
-esphna2 push ix
-        pop de
-        ld hl,esp_dnsres
-        ld bc,4
-        ldir
-        ld hl,esp_dnsb
-        ld bc,64
-        ldir
-        ld a,(esp_hni)
-        inc a
-        and 3
-        ld (esp_hni),a
         ret
 
 ;### ESPTOP -> poll the outstanding TCP open
@@ -1034,8 +968,31 @@ esptop  call espenter
         ld (hl),d
         ld a,sckstates
         jr esptop7
-esptop5 call espskp             ;failed - drain payload, mark closed
+esptop5 ld (esp_toprc),a
+        call espskp             ;failed - drain payload, mark closed
         call espleave
+        ld a,(esp_pendsck)
+        ld c,a
+        ld b,0
+        ld hl,esp_tlsreq
+        add hl,bc
+        ld a,(hl)
+        or a
+        jr z,esptop3            ;plain TCP, only no free connection is reported
+        ld a,(esp_toprc)
+        cp 1
+        jr z,esptop4
+        ld a,neterrtls          ;TLS handshake, certificate or host name
+        jr esptop6
+esptop4 ld a,neterrsfr          ;the ESP has no free connection or TLS session
+        jr esptop6
+esptop3 ld a,(esp_toprc)
+        cp 1
+        jr z,esptop4
+        xor a
+esptop6 ld hl,esp_reason
+        add hl,bc
+        ld (hl),a
         ld a,sckstatcl
 esptop7 push af
         ld a,(esp_pendsck)
@@ -1050,6 +1007,7 @@ esptop7 push af
         ret
 esptop9 call espleave
         ret
+esp_toprc db 0
 
 ;### ESPSLT -> HL=address of esp_conn entry for socket A
 espslot ld c,a
@@ -1130,6 +1088,8 @@ espstq9 call espleave
 ;          4 established,9 close-wait (check TCP/IP UNAPI spec 4.5.x).
 lowtst  ld (lowtsts),a
         ld c,a
+        xor a
+        ld (esp_lastreason),a
         ld a,(esp_pend)
         cp esp_fn_tcpopen
         jr nz,lowtst1
@@ -1137,7 +1097,16 @@ lowtst  ld (lowtsts),a
         cp c
         jr nz,lowtst1
         call esppol             ;try to finish the pending open
-lowtst1 ld a,(lowtsts)
+lowtst1 ld a,(esp_pend)         ;a long request is outstanding, no other ESP command may be sent
+        or a
+        jr z,lowtst1a
+        cp esp_fn_tcpopen
+        jp nz,lowtstz           ;pending DNS, report in process
+        ld a,(esp_pendsck)
+        ld hl,lowtsts
+        cp (hl)
+        jp nz,lowtstz           ;pending open of another socket, report in process
+lowtst1a ld a,(lowtsts)
         call espslot
         ld a,(hl)
         or a
@@ -1166,21 +1135,30 @@ lowtst2 ld a,(lowtsts)
         ld b,sckstates
         cp 4:jr z,lowtst3       ;4 established
         ld b,sckstatcw
-        cp 9:jr z,lowtst3       ;9 close wait
+        cp 7:jr z,lowtst4       ;7 close wait, the peer has sent its FIN
+        cp 9:jr z,lowtst4       ;9 last ack
         ld b,sckstatcl          ;anything else = closing/unknown
+        jr lowtst3
+lowtst4 ld a,(esp_st_avail+0)   ;data is still buffered, keep reporting established until it is read
+        ld hl,esp_st_avail+1
+        or (hl)
+        jr z,lowtst3            ;nothing buffered, report the closing state
+        ld b,sckstates
 lowtst3 ld a,b
         ld bc,(esp_st_avail)
         ld ix,(esp_st_ip+0)
         ld iy,(esp_st_ip+2)
         ld de,(esp_st_port)
         ld l,a
+        call lowtstr            ;esp_lastreason for the daemon
         ld a,b
         or c
         ld a,l
         ret z
         set 7,a                 ;data waiting
         ret
-lowtstc ld a,sckstatcl
+lowtstc call lowtstr
+        ld a,sckstatcl
         ld bc,0
         ld ix,0
         ld iy,0
@@ -1190,13 +1168,39 @@ lowtstz xor a
         ret
 lowtsts db 0
 
+;### LOWTSTR -> esp_lastreason = close reason of the socket in lowtsts
+;### Destroyed  AF
+lowtstr push hl
+        ld hl,esp_reason
+        ld a,(lowtsts)
+        add a,l
+        ld l,a
+        jr nc,lowtstr1
+        inc h
+lowtstr1 ld a,(hl)
+        ld (esp_lastreason),a
+        pop hl
+        ret
+
 ;### LOWTTX -> TCP send
 ;### Input      A=socket, BC=length, E,HL=source (E=bank)
 ;### Output     BC=sent bytes, HL=remaining bytes (ZF=1 -> all sent)
 ;### Destroyed  AF,DE,IX,IY
 ;  Data is bounced through esp_buf in chunks; it is copied OUT of the caller's
 ;  bank with jmp_bnkcop BEFORE the window is opened.
-lowttx  ld (lowttxs),a
+lowttx  push af
+        ld a,(esp_pend)         ;a long request is outstanding, send nothing now
+        or a
+        jr z,lowttx0
+        pop af
+        ld h,b
+        ld l,c                  ;HL=nothing sent, all bytes remaining
+        ld bc,0
+        ld a,h
+        or l
+        ret
+lowttx0 pop af
+        ld (lowttxs),a
         ld (lowttxb),de         ;e=bank
         ld (lowttxl),bc
         ld (lowttxa),hl
@@ -1281,7 +1285,16 @@ lowttxc dw 0
 lowtsk  ld d,1
         jr lowtrx0
 lowtrx  ld d,0
-lowtrx0 ld (lowtrxm),de         ;d=mode(1=skip) e=bank
+lowtrx0 push af
+        ld a,(esp_pend)         ;a long request is outstanding, deliver nothing now
+        or a
+        jr z,lowtrx0a
+        pop af
+        ld bc,0
+        scf                     ;CF=1 tells the daemon nothing was delivered
+        ret
+lowtrx0a pop af
+        ld (lowtrxm),de         ;d=mode(1=skip) e=bank
         ld (lowtrxs),a
         ld (lowtrxl),bc
         ld (lowtrxa),hl
@@ -1361,8 +1374,9 @@ lowtrxw call espleave
 lowtrx9 ld a,(lowtrxs)          ;remaining bytes = ask the ESP
         call espstq
         ld bc,0
-        ret c
+        jr c,lowtrx9a
         ld bc,(esp_st_avail)
+lowtrx9a or a                   ;CF=0, delivered
         ret
 lowtrxm dw 0                    ;low=bank (E), high=mode (D)
 lowtrxs db 0
@@ -1377,7 +1391,15 @@ lowtrxn dw 0
 lowtdc  ld c,esp_fn_tcpabort
         jr lowtcl0
 lowtcl  ld c,esp_fn_tcpclose
-lowtcl0 push bc
+lowtcl0 ld b,a
+        ld a,(esp_pend)         ;a long request is outstanding, the daemon keeps the socket
+        or a
+        ld a,b
+        jr z,lowtcl1
+        ld a,neterrcon
+        scf
+        ret
+lowtcl1 push bc
         call espslot
         ld a,(hl)
         ld b,a
@@ -1386,7 +1408,7 @@ lowtcl0 push bc
         or a
         ret z                   ;nothing open on the ESP side
         call espenter
-        ret c
+        jr c,lowtcl9            ;no hardware, nothing more to do
         ld a,e
         ld hl,1
         call espcmd
@@ -1396,7 +1418,7 @@ lowtcl0 push bc
         call esprsp
         call nc,espskp
         call espleave
-        xor a
+lowtcl9 xor a
         ret
 
 ;### LOWTFL -> flush - the ESP has no send buffer to flush
@@ -1523,9 +1545,9 @@ esp_fn_udpclose equ 9
 esp_fn_udpstate equ 10
 esp_fn_udpsend  equ 11
 esp_fn_udprcv   equ 12
-esp_udpmax      equ 576         ;largest datagram payload handled
-esp_udpmaxl     equ #40         ;576 = #0240
-esp_udpmaxh     equ #02
+esp_udpmax      equ UDPMAX      ;largest datagram payload handled, 576 or 1468
+esp_udpmaxl     equ UDPMAX mod 256
+esp_udpmaxh     equ UDPMAX/256
 
 esp_uconn       ds low_sockmax  ;ESP connection number per daemon socket, 0 = none
 esp_uown        db 255          ;socket that owns the datagram in esp_urxb, 255 = none
@@ -1558,7 +1580,14 @@ espuslt ld c,a
 ;### Output     CF=0 ok, CF=1 A=error
 ;### Destroyed  AF,BC,DE,HL,IX
 lowuop  push af
-        ld a,(ix+0)             ;read the parameter before the slot window opens
+        ld a,(esp_pend)         ;a long request is outstanding, try again later
+        or a
+        jr z,lowuop1
+        pop af
+        ld a,neterrcon
+        scf
+        ret
+lowuop1 ld a,(ix+0)             ;read the parameter before the slot window opens
         ld (esp_tmp+0),a
         ld a,(ix+1)
         ld (esp_tmp+1),a
@@ -1601,7 +1630,15 @@ lowuop0 equ lowuop
 ;### LOWUCL -> close UDP socket
 ;### Input      A=socket
 ;### Output     A=0
-lowucl  ld (esp_usck),a
+lowucl  ld c,a
+        ld a,(esp_pend)         ;a long request is outstanding, the daemon keeps the socket
+        or a
+        ld a,c
+        jr z,lowucl0
+        ld a,neterrcon
+        scf
+        ret
+lowucl0 ld (esp_usck),a
         call espuslt
         ld a,(hl)
         ld (esp_ucn),a
@@ -1616,7 +1653,7 @@ lowucl1 ld a,(esp_ucn)
         or a
         ret z
         call espenter
-        ret c
+        jr c,lowucl9            ;no hardware, nothing more to do
         ld hl,1
         ld a,esp_fn_udpclose
         call espcmd
@@ -1626,7 +1663,7 @@ lowucl1 ld a,(esp_ucn)
         call esprsp
         call nc,espskp
         call espleave
-        xor a
+lowucl9 xor a
         ret
 
 ;### ESPUCL0 -> UDP_CLOSE with connection 0 = close all transient UDP connections of the ESP
@@ -1647,7 +1684,16 @@ espucl0 call espenter
 ;### Input      A=socket, HL=data, E=data bank, BC=length, IX=destination (IP 4 bytes, port 2 bytes)
 ;### Output     CF=0 sent, CF=1 A=error
 ;### Destroyed  AF,BC,DE,HL,IX,IY
-lowutx  ld (esp_utxs),a
+lowutx  push af
+        ld a,(esp_pend)         ;a long request is outstanding, try again later
+        or a
+        jr z,lowutx9
+        pop af
+        ld a,neterrcon
+        scf
+        ret
+lowutx9 pop af
+        ld (esp_utxs),a
         ld a,e
         ld (lowutxb),a
         ld (esp_utxl),bc
@@ -1795,7 +1841,16 @@ lowust  ld (esp_usck),a
         jr z,lowust5            ;a datagram of this socket is waiting
         inc a
         jp nz,lowusti           ;the buffer holds the datagram of another socket
-        ld hl,esp_upoll
+        ld a,(esp_pend)         ;a long request is outstanding, do not poll the ESP now
+        or a
+        jr z,lowust1
+        ld bc,0
+        ld ix,0
+        ld iy,0
+        ld de,0
+        xor a                   ;0 = in process, no state change event
+        ret
+lowust1 ld hl,esp_upoll
         dec (hl)
         jr nz,lowusti
         ld (hl),2               ;ask the ESP on every 2nd poll while an application waits
@@ -1829,11 +1884,15 @@ lowurx  ld a,e
         ld (lowurxb),a
         ld (lowurxa),hl
         ld hl,(esp_urxn)
+        ld a,b
+        or c
+        jr z,lowurx0            ;BC=0, the whole datagram
         or a
         sbc hl,bc
-        jr nc,lowurx1           ;the datagram is not shorter than the buffer, use BC
-        ld bc,(esp_urxn)
-lowurx1 ld a,b
+        jr nc,lowurx1           ;the datagram is not shorter than BC, copy BC bytes and drop the rest
+lowurx0 ld bc,(esp_urxn)        ;BC larger than the datagram or zero, the whole datagram
+lowurx1 ld (lowurxc),bc         ;the number of bytes copied
+        ld a,b
         or c
         jr z,lowurx2
         ld a,(lowurxb)          ;A=(dest<<4)+src
@@ -1844,11 +1903,13 @@ lowurx1 ld a,b
         ld de,(lowurxa)
         rst #20:dw jmp_bnkcop
 lowurx2 ld a,255
-        ld (esp_uown),a         ;the buffer is free again
+        ld (esp_uown),a         ;the buffer is free again, the datagram is consumed in any case
         ld a,esp_sta_delay
         ld (esp_sta_rx),a       ;RX light
+        ld bc,(lowurxc)
         or a
         ret
+lowurxc dw 0
 
 ;### LOWUSK -> throw the waiting datagram away
 ;### Input      A=socket
@@ -1924,7 +1985,6 @@ espdnp  call espenter
         call espgtb:jr c,espdnp9:ld (esp_dnsres+2),a
         call espgtb:jr c,espdnp9:ld (esp_dnsres+3),a
         call espleave
-        call esphnadd
         ld a,2
         jr espdnp7
 espdnp5 call espskp
@@ -1958,4 +2018,538 @@ espdnr2 xor a
         ld (esp_dnsst),a
         ld a,neterrdto          ;ESP gives no detail on DNS failure
         scf
+        ret
+
+
+;==============================================================================
+;### WIFI SCAN AND JOIN (Scan tab) ############################################
+;==============================================================================
+; The commands S (scan), s (scan result), a (forget access point) and g (status) are single bytes,
+; they have no length field. A (join) has the normal header. S, A and a answer with just [fn][rc],
+; s answers with [s][rc][count] and then count times  name,0,'O' or 'E'  without any length field.
+;
+; The ESP keeps the names in the table below, one entry is 37 bytes
+;   +0 length of the name, +1 encrypted (0 or 1), +2.. name, then " *" if encrypted, then 0
+esp_scmax       equ 10          ;networks that are kept
+esp_scsiz       equ 37
+esp_scn         db 0            ;number of entries in the table
+esp_sctab       ds esp_scmax*esp_scsiz
+esp_scc         db 0            ;networks the ESP still has to send
+esp_sce         dw 0            ;entry that is filled now
+esp_snp         dw 0            ;where the next character of the name goes
+esp_scl         db 0            ;length of the name so far
+esp_jent        dw 0            ;join - entry
+esp_jpwd        dw 0            ;join - password
+esp_jpl         db 0            ;join - length of the password
+esp_jtl         db 0            ;join - length of the request data
+
+;### ESPQRS -> wait for a short response [fn][rc]
+;### Input      A=fn, window open, (esp_wdef)=frames to wait
+;### Output     CF=0 A=return code, CF=1 no answer
+esp_qfn         db 0
+espqrs  ld (esp_qfn),a
+        ld a,(esp_wdef)
+        ld (esp_wcnt),a
+        ld hl,esp_skipmax
+        ld (esp_skipn),hl
+espqrs1 call espgtw
+        ret c
+        ld hl,esp_qfn
+        cp (hl)
+        jr z,espqrs2
+        ld hl,(esp_skipn)
+        dec hl
+        ld (esp_skipn),hl
+        ld a,h
+        or l
+        jr nz,espqrs1
+        scf
+        ret
+espqrs2 call espgtb
+        ret
+
+;### ESPGTQ -> read one byte of the scan result, waits up to 3 frames
+;### Output     CF=0 A=byte, CF=1 nothing came
+espgtq  ld a,3
+        ld (esp_wcnt),a
+        jp espgtw
+
+;### ESPSCAN -> scan for access points, fills the table
+;### Output     A=0 networks found (esp_scn entries), 1 no network in range, 2 no answer
+;### Destroyed  all
+espscan call espenter
+        jr c,espscn9
+        ld a,esp_cmd_clrfifo
+        ld (esp_mem_cmd),a
+        ld a,"S"
+        call espsnd
+        ld a,"S"
+        call espqrs
+        call espleave
+        jr c,espscn9
+        ld b,30                 ;poll for the result, 30 x 25 frames at most
+espscn1 push bc
+        ld b,25
+espscn2 halt
+        djnz espscn2
+        call espenter
+        jr c,espscn8
+        ld a,esp_cmd_clrfifo
+        ld (esp_mem_cmd),a
+        ld a,"s"
+        call espsnd
+        ld a,"s"
+        call espqrs
+        jr c,espscn7
+        or a
+        jr z,espscn5            ;0 = result follows
+        cp 3
+        jr z,espscn6            ;3 = scan still running
+        call espleave           ;2 = no network
+        pop bc
+        ld a,1
+        ret
+espscn5 call espscrd
+        call espleave
+        pop bc
+        ld a,(esp_scn)
+        or a
+        ld a,0
+        ret nz
+        inc a                   ;only hidden networks
+        ret
+espscn6 call espleave
+        pop bc
+        djnz espscn1
+        jr espscn9
+espscn7 call espleave
+espscn8 pop bc
+espscn9 ld a,2
+        ret
+
+;### ESPSCRD -> read the list that follows the 0 of a scan result, window is open
+espscrd xor a
+        ld (esp_scn),a
+        call espgtq             ;number of networks
+        ret c
+        ld (esp_scc),a
+        ld hl,esp_sctab
+        ld (esp_sce),hl
+espscr1 ld a,(esp_scc)
+        or a
+        ret z
+        dec a
+        ld (esp_scc),a
+        ld hl,(esp_sce)
+        inc hl
+        inc hl
+        ld (esp_snp),hl
+        xor a
+        ld (esp_scl),a
+espscr2 call espgtq             ;the name
+        ret c
+        or a
+        jr z,espscr4
+        ld c,a
+        ld a,(esp_scl)
+        cp 32
+        jr nc,espscr2           ;longer than 32, drop the rest
+        ld hl,(esp_snp)
+        ld (hl),c
+        inc hl
+        ld (esp_snp),hl
+        ld hl,esp_scl
+        inc (hl)
+        jr espscr2
+espscr4 call espgtq             ;O = open, E = encrypted
+        ret c
+        ld c,a
+        ld a,(esp_scn)
+        cp esp_scmax
+        jr nc,espscr1           ;table is full
+        ld a,(esp_scl)
+        or a
+        jr z,espscr1            ;hidden network
+        call espsdup
+        jr z,espscr1            ;this name is in the table already
+        ld hl,(esp_sce)
+        ld a,(esp_scl)
+        ld (hl),a
+        inc hl
+        ld a,c
+        cp "E"
+        ld a,0
+        jr nz,espscr5
+        inc a
+espscr5 ld (hl),a
+        ld hl,(esp_snp)
+        or a
+        jr z,espscr6
+        ld (hl)," "
+        inc hl
+        ld (hl),"*"
+        inc hl
+espscr6 ld (hl),0
+        ld hl,esp_scn
+        inc (hl)
+        ld hl,(esp_sce)
+        ld de,esp_scsiz
+        add hl,de
+        ld (esp_sce),hl
+        jr espscr1
+
+;### ESPSDUP -> is the name just read (at esp_sce+2, esp_scl long) in the table already?
+;### Output     ZF=1 yes
+;### Destroyed  AF,BC,DE,HL
+espsdup ld a,(esp_scn)
+        or a
+        jr nz,espsdu0
+        inc a                   ;table is empty, ZF=0
+        ret
+espsdu0 ld b,a
+        ld hl,esp_sctab
+espsdu1 ld a,(esp_scl)
+        cp (hl)
+        jr nz,espsdu4
+        push bc
+        push hl
+        inc hl
+        inc hl
+        ld de,(esp_sce)
+        inc de
+        inc de
+        ld b,a
+espsdu2 ld a,(de)
+        cp (hl)
+        jr nz,espsdu3
+        inc hl
+        inc de
+        djnz espsdu2
+        pop hl
+        pop bc
+        xor a                   ;same, ZF=1
+        ret
+espsdu3 pop hl
+        pop bc
+espsdu4 ld de,esp_scsiz
+        add hl,de
+        djnz espsdu1
+        ld a,1
+        or a                    ;ZF=0
+        ret
+
+;### ESPJOIN -> connect to an access point, takes up to 15 seconds
+;### Input      HL=table entry, DE=password (0 terminated, empty for an open network)
+;### Output     A=0 connected, 1 the ESP could not connect, 2 no answer
+;### Destroyed  all
+espjoin ld (esp_jent),hl
+        ld (esp_jpwd),de
+        ex de,hl
+        ld c,0
+espjoi0 ld a,(hl)
+        or a
+        jr z,espjoi1
+        inc hl
+        inc c
+        ld a,c
+        cp 64
+        jr c,espjoi0
+espjoi1 ld a,c
+        ld (esp_jpl),a
+        ld hl,(esp_jent)
+        ld a,(hl)
+        inc a
+        add c
+        ld (esp_jtl),a
+        call espenter
+        jr c,espjoi9
+        ld a,esp_cmd_clrfifo
+        ld (esp_mem_cmd),a
+        ld a,(esp_jtl)
+        ld l,a
+        ld h,0
+        ld a,"A"
+        call espcmd
+        ld hl,(esp_jent)
+        ld a,(hl)
+        ld b,a
+        inc hl
+        inc hl
+espjoi2 ld a,(hl)
+        call espsnd
+        inc hl
+        djnz espjoi2
+        xor a
+        call espsnd             ;end of the name
+        ld a,(esp_jpl)
+        or a
+        jr z,espjoi4
+        ld b,a
+        ld hl,(esp_jpwd)
+espjoi3 ld a,(hl)
+        call espsnd
+        inc hl
+        djnz espjoi3
+espjoi4 ld a,(esp_wdef)
+        push af
+        ld a,250
+        ld (esp_wdef),a
+        ld b,3                  ;up to 3 x 250 frames, the ESP gives up after 10 seconds
+espjoi5 push bc
+        ld a,"A"
+        call espqrs
+        pop bc
+        jr nc,espjoi6
+        djnz espjoi5
+        pop af
+        ld (esp_wdef),a
+        call espleave
+        jr espjoi9
+espjoi6 ld c,a
+        pop af
+        ld (esp_wdef),a
+        call espleave
+        ld a,c
+        or a
+        ret z
+        ld a,1
+        ret
+espjoi9 ld a,2
+        ret
+
+;### ESPDISC -> disconnect from the access point and forget it
+;### Output     A=0 done, 2 no answer
+;### Destroyed  all
+espdisc call espenter
+        jr c,espdis9
+        ld a,esp_cmd_clrfifo
+        ld (esp_mem_cmd),a
+        ld a,"a"
+        call espsnd
+        ld a,"a"
+        call espqrs
+        call espleave
+        jr c,espdis9
+        xor a
+        ret
+espdis9 ld a,2
+        ret
+
+
+;==============================================================================
+;### FIRMWARE VERSION, FIRMWARE UPDATE AND CERTIFICATE UPDATE #################
+;==============================================================================
+; V (version) and E (end of update) are single byte commands. V answers [V][major][minor].
+; Z (firmware) and Y (certificates) start an update, the request is [fn][0][12] then the file size as 8 bytes
+; (little endian) and the first 4 bytes of the file. z sends one block [z][len MSB][len LSB] and the data.
+; Z Y z and E answer with [fn][rc] only. After E the ESP flashes the new data and restarts.
+; I (create the certificate index) is a single byte command that answers [I][rc].
+esp_fwbuf       ds 256          ;one block of the file
+esp_fwsz        ds 4            ;size of the file
+esp_fwmaj       db 0
+esp_fwmin       db 0
+esp_fwfn        db 0
+esp_fwlen       dw 0
+esp_ql          db 0
+esp_qlsv        db 0
+
+;### ESPQRL -> like ESPQRS, but waits up to B x 250 frames
+;### Input      A=fn, B=number of periods, window open
+;### Output     CF=0 A=return code, CF=1 no answer
+espqrl  ld (esp_ql),a
+        ld a,(esp_wdef)
+        ld (esp_qlsv),a
+        ld a,250
+        ld (esp_wdef),a
+espql1  push bc
+        ld a,(esp_ql)
+        call espqrs
+        pop bc
+        jr nc,espql2
+        djnz espql1
+        ld a,(esp_qlsv)
+        ld (esp_wdef),a
+        scf
+        ret
+espql2  push af
+        ld a,(esp_qlsv)
+        ld (esp_wdef),a
+        pop af
+        or a
+        ret
+
+;### ESPVER -> read the firmware version of the ESP, builds the text in cfgtxtver
+;### Output     A=0 ok (esp_fwmaj and esp_fwmin), 2 no answer
+espver  call espenter
+        jr c,espver9
+        ld a,esp_cmd_clrfifo
+        ld (esp_mem_cmd),a
+        ld a,"V"
+        call espsnd
+        ld a,"V"
+        call espqrs             ;the first byte after the V is the major version
+        jr c,espver8
+        ld (esp_fwmaj),a
+        call espgtb
+        jr c,espver8
+        ld (esp_fwmin),a
+        call espleave
+        ld hl,cfgtxtver
+        ld a,(esp_fwmaj)
+        add "0"
+        ld (hl),a
+        inc hl
+        ld (hl),"."
+        inc hl
+        ld a,(esp_fwmin)
+        add "0"
+        ld (hl),a
+        inc hl
+        ld (hl),0
+        xor a
+        ret
+espver8 call espleave
+espver9 ld a,2
+        ret
+
+;### ESPFWBG -> start an update
+;### Input      A="Z" firmware or "Y" certificates, (esp_fwsz)=size of the file, the first 4 bytes of the file in esp_fwbuf
+;### Output     A=0 accepted, 1 the ESP refused it, 2 no answer
+;### Destroyed  all
+espfwbg ld (esp_fwfn),a
+        call espenter
+        jr c,espfwb9
+        ld a,esp_cmd_clrfifo
+        ld (esp_mem_cmd),a
+        ld hl,12
+        ld a,(esp_fwfn)
+        call espcmd
+        ld hl,esp_fwsz
+        ld b,4
+espfwb1 ld a,(hl)
+        call espsnd
+        inc hl
+        djnz espfwb1
+        xor a
+        ld b,4
+espfwb2 call espsnd             ;upper half of the 8 byte size is 0
+        djnz espfwb2
+        ld hl,esp_fwbuf
+        ld b,4
+espfwb3 ld a,(hl)
+        call espsnd
+        inc hl
+        djnz espfwb3
+        ld a,(esp_fwfn)
+        ld b,2
+        call espqrl
+        call espleave
+        jr c,espfwb9
+        or a
+        ld a,0
+        ret z
+        inc a
+        ret
+espfwb9 ld a,2
+        ret
+
+;### ESPFWBK -> send one block of the file
+;### Input      HL=number of bytes in esp_fwbuf (1 to 256)
+;### Output     A=0 written, 1 the ESP refused it, 2 no answer
+;### Destroyed  all
+espfwbk ld (esp_fwlen),hl
+        call espenter
+        jr c,espfwk9
+        ld a,esp_cmd_clrfifo
+        ld (esp_mem_cmd),a
+        ld hl,(esp_fwlen)
+        ld a,"z"
+        call espcmd
+        ld hl,esp_fwbuf
+        ld bc,(esp_fwlen)
+espfwk1 ld a,(hl)
+        ld (esp_mem_tx),a
+        inc hl
+        dec bc
+        ld a,b
+        or c
+        jr nz,espfwk1
+        ld a,"z"
+        ld b,3
+        call espqrl
+        call espleave
+        jr c,espfwk9
+        or a
+        ld a,0
+        ret z
+        inc a
+        ret
+espfwk9 ld a,2
+        ret
+
+;### ESPFWEN -> finish an update, the ESP flashes the new data and restarts, then waits until it answers again
+;### Output     A=0 done, 1 the ESP did not accept the data, 2 no answer
+;### Destroyed  all
+espfwen ld b,60                 ;wait one second
+espfwe0 halt
+        djnz espfwe0
+        call espenter
+        jr c,espfwe9
+        ld a,esp_cmd_clrfifo
+        ld (esp_mem_cmd),a
+        ld a,"E"
+        call espsnd
+        ld a,"E"
+        ld b,8                  ;up to 2000 frames
+        call espqrl
+        call espleave
+        jr c,espfwe9
+        or a
+        jr nz,espfwe8
+        ld c,90                 ;the ESP restarts now, ask for the version until it answers
+espfwe2 ld b,60
+espfwe3 halt
+        djnz espfwe3
+        push bc
+        call espver
+        pop bc
+        or a
+        ret z
+        dec c
+        jr nz,espfwe2
+        jr espfwe9
+espfwe8 ld a,1
+        ret
+espfwe9 ld a,2
+        ret
+
+;### ESPCRT -> after a certificate update the ESP builds its certificate index (command I), this takes a while
+;### Output     A=0 done, 1 failed, 2 no answer
+;### Destroyed  all
+espcrt  ld c,3
+espcrt1 ld b,60                 ;wait one second
+espcrt2 halt
+        djnz espcrt2
+        push bc
+        call espenter
+        jr c,espcrt8
+        ld a,esp_cmd_clrfifo
+        ld (esp_mem_cmd),a
+        ld a,"I"
+        call espsnd
+        ld a,"I"
+        ld b,16                 ;up to 4000 frames
+        call espqrl
+        call espleave
+        pop bc
+        jr c,espcrt3
+        or a
+        ld a,0
+        ret z
+        inc a
+        ret
+espcrt8 pop bc
+espcrt3 dec c
+        jr nz,espcrt1
+        ld a,2
         ret

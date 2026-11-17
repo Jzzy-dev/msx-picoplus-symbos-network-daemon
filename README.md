@@ -7,6 +7,16 @@ It is DRIVER=6 inside the SymbOS Network Daemon source (GPL-3.0) and also builds
 Status: confirmed working on real MSX Pico+ hardware (SymbOS 4.0, MSX2, Nextor boot with the SD driver,
 1 MB mapper from a PicoVerse 2350). DHCP, DNS, TCP, UDP (SNTP) and HTTPS work.
 
+Version 0.8 (branch `ocm-fixes`) carries over the work done for the PicoVerse 2350 daemon:
+* A Scan tab in the network settings, to scan for WiFi networks, join one with a password and disconnect.
+* An ESP8266 tab with the ESP firmware version, a firmware update and a certificate update from a file
+  (SymbOS file selector, progress window) and a check box to verify HTTPS server certificates.
+* TLS is requested explicitly in TCP_Open (mode bit 2, bit 3 verifies, BC = host name), no more guessing by
+  port 443. Programs have to ask for it, the included Net Test does.
+* The protocol fixes from ducasp's OCM daemon (issue 1 of the PicoVerse repository), see
+  `docs/README-ESP-driver.md`.
+Not yet tried on real MSX Pico+ hardware. The version before this one is on `main`.
+
 <img width="2000" height="1500" alt="WhatsApp Image 2026-11-09 at 21 30 14" src="https://github.com/user-attachments/assets/6eea7bcf-5b23-4b28-a5d1-985a57528611" />
 
 ## Build (WinAPE 1.0.13)
@@ -22,10 +32,11 @@ In the daemon set Cartridge Slot/Subslot to the slot of the MSX Pico+ (tested: s
 
 ## Files
 
-- `src/Dmn-Network.asm` - patched daemon (UDP handlers, tcpsta fix, DRIVER=6 branch)
+- `src/Dmn-Network.asm` - patched daemon (UDP handlers, tcpsta fix, DRIVER=6 branch, Scan and ESP8266 tabs)
 - `src/Dmn-Network-ESP.asm` - the ESP driver (transport, detection, TCP, DNS, UDP, TLS)
 - `src/Dmn-Network-i18n-direct.asm` - texts
-- `src/NetTest*.asm` - Net Test companion app (world clock via SNTP, weather, sun times, HTTPS check)
+- `src/Dmn-Network-libs.asm` - the flattened SymbOS libraries the daemon and Net Test use
+- `src/NetTest*.asm` - Net Test companion app (world clock via SNTP, weather, sun times, HTTPS check, from ducasp's update for explicit TLS)
 - `docs/README-ESP-driver.md`, `docs/README-NetTest.md` - details
 - `docs/Dmn-Network-DRIVER6.diff` - changes against the original `Dmn-Network.asm`
 

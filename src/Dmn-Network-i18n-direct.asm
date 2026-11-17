@@ -65,12 +65,12 @@ statxtfrc   db "DNS settings",0
 statxtfrd   db "Status",0
 if DRIVER=6
 if MSXPICO=1
-statxtfre   db "MSX Pico+ ESP v0.5",0
+statxtfre   db "MSX Pico+ ESP v0.8",0
 else
-statxtfre   db "MSX PcVrs ESP v0.5",0
+statxtfre   db "MSX PcVrs ESP v0.8",0
 endif
 else
-statxtfre   db "MSX PcVrs ESP v0.5",0
+statxtfre   db "MSX PcVrs ESP v0.8",0
 endif
 statxtfrf   db "Localhost Settings",0
 statxtfrg   db "GR8NET Settings",0

@@ -129,6 +129,8 @@ neterrdtr   equ 19  ;dns - truncated answer
 neterrdln   equ 20  ;dns - package too large
 
 neterrtes   equ 24  ;tcp - connection not yet established
+neterrtls   equ 25  ;tcp - TLS handshake or certificate failed
+neterrhst   equ 26  ;tcp - TLS host name missing or invalid
 
 
 ;==============================================================================
@@ -196,6 +198,9 @@ else
 cfg_slots   db 1,0      ;pslot=1 as default for denyonet
 endif
 cfg_hide    db 0
+if DRIVER=6
+cfg_tlsver  db TLSVERIFY    ;1 = the ESP checks the certificates of HTTPS servers
+endif
 
 cfg_end     ;***// CONFIG DATA
 
@@ -542,15 +547,21 @@ staupd4 ld (ix+4),c
         jp SyDesktop_WINDIN
 staupd6                         ;*** DRIVER TAB
 if DRIVER=6
-        ld a,(esp_ssidchg)      ;the access point text changed, redraw that line (control 17)
+        ld a,(esp_ssidchg)      ;the access point text changed, redraw that line (control 17, 5 on the Scan tab)
         or a
         jr z,staupd6a
         xor a
         ld (esp_ssidchg),a
         ld e,17
-        ld a,(stawinid)
+        ld a,(stactltba0)
+        cp 3
+        jr nz,staupd6b
+        ld e,5
+staupd6b ld a,(stawinid)
         call SyDesktop_WINDIN
-staupd6a
+staupd6a ld a,(stactltba0)
+        cp 3
+        ret z                   ;the Scan tab has nothing else to update
 endif
 if DRIVER=0
         ld a,r
@@ -723,6 +734,9 @@ staapl2 ;...message "wrong mac"
 
 ;### STATAB -> changes status window tab
 statabadr   dw stawingrpa,stawingrpb,stawingrpc
+if DRIVER=6
+            dw stawingrpd
+endif
 statabact   db 0
 statab  ld a,(stactltba0)
         ld hl,statabact
@@ -762,6 +776,630 @@ stapws  ld hl,stactlia1p
         ld a,(stawinid)
         call SyDesktop_WINDIN
         jp prgprz0
+endif
+
+if DRIVER=6
+;==============================================================================
+;### SCAN TAB (WiFi networks) #################################################
+;==============================================================================
+
+;### SCNMSG -> shows a text in the message line of the Scan tab
+;### Input      HL=text (0 terminated, up to 43 characters)
+scnmsg  ld de,scnbufms
+scnmsg1 ld a,(hl)
+        ld (de),a
+        inc hl
+        inc de
+        or a
+        jr nz,scnmsg1
+scnmsg2 ld e,13
+        ld a,(stawinid)
+        jp SyDesktop_WINDIN
+
+;### SCNMSGX -> shows a text and continues with the main loop
+scnmsgx call scnmsg
+        jp prgprz0
+
+;### SCNLST -> builds the list of the combo box from the table of the driver
+scnlst  ld a,(esp_scn)
+        or a
+        jr z,scnlst3
+        ld b,a
+        ld hl,esp_sctab+2
+        ld de,scnlstcb
+        ld c,0
+scnlst1 ld a,c
+        ld (de),a
+        inc de
+        xor a
+        ld (de),a
+        inc de
+        ld a,l
+        ld (de),a
+        inc de
+        ld a,h
+        ld (de),a
+        inc de
+        push de
+        ld de,esp_scsiz
+        add hl,de
+        pop de
+        inc c
+        djnz scnlst1
+        ld a,(esp_scn)
+        jr scnlst4
+scnlst3 ld hl,0                 ;nothing found, the list shows one dummy line
+        ld (scnlstcb),hl
+        ld hl,scntxnl
+        ld (scnlstcb+2),hl
+        ld a,1
+scnlst4 ld l,a
+        ld h,0
+        ld (scnctlcb),hl        ;number of lines
+        ld hl,0
+        ld (scnctlcb+12),hl     ;first line is selected
+        ld e,6
+        ld a,(stawinid)
+        jp SyDesktop_WINDIN
+
+;### SCNSCAN -> scan button, looks for access points
+scnscan ld hl,scntxsc
+        call scnmsg
+        call espscan
+        or a
+        jr z,scnsca2
+        push af
+        xor a
+        ld (esp_scn),a
+        call scnlst
+        pop af
+        ld hl,scntxno           ;1 = nothing in range
+        dec a
+        jp z,scnmsgx
+        ld hl,scntxfl           ;2 = no answer
+        jp scnmsgx
+scnsca2 call scnlst
+        ld a,(esp_scn)
+        ld hl,scnbufms
+        call clcn08
+        ex de,hl
+        ld hl,scntxfd
+scnsca3 ld a,(hl)
+        ld (de),a
+        inc hl
+        inc de
+        or a
+        jr nz,scnsca3
+        call scnmsg2
+        jp prgprz0
+
+;### SCNCONN -> connect button, joins the selected network
+scnconn ld a,(esp_scn)
+        or a
+        ld hl,scntxse
+        jp z,scnmsgx            ;scan first
+        ld a,(scnctlcb+12)
+        ld c,a
+        ld a,(esp_scn)
+        dec a
+        cp c
+        jr nc,scncon0
+        ld c,0                  ;selection out of range, take the first one
+scncon0 ld hl,esp_sctab
+        ld de,esp_scsiz
+        inc c
+scncon1 dec c
+        jr z,scncon2
+        add hl,de
+        jr scncon1
+scncon2 ld (scnent),hl
+        inc hl
+        ld a,(hl)               ;encrypted?
+        ld de,scnzero
+        or a
+        jr z,scncon3
+        ld de,scnbufpw
+        ld a,(de)
+        or a
+        ld hl,scntxpw           ;a password is needed
+        jp z,scnmsgx
+scncon3 ld (scnpwd),de
+        ld hl,scntxcn
+        call scnmsg
+        ld hl,(scnent)
+        ld de,(scnpwd)
+        call espjoin
+        push af
+        call scnrefr
+        pop af
+        ld hl,scntxok
+        or a
+        jp z,scnmsgx
+        ld hl,scntxnc
+        dec a
+        jp z,scnmsgx
+        ld hl,scntxfl
+        jp scnmsgx
+
+;### SCNDISC -> disconnect button, leaves the access point and forgets it
+scndisc call espdisc
+        call scnrefr
+        ld hl,scntxdi
+        jp scnmsgx
+
+;### SCNREFR -> after a join or leave, back to "no IP" so the daemon reads the IP data again
+scnrefr ld a,1
+        call netini0
+        ld a,1
+        ld (netipsc),a
+        jp espap
+
+;### SCNPWS -> show/hide password
+scnpws  ld hl,scnctlpwp
+        ld a,(hl)
+        xor 1
+        ld (hl),a
+        ld e,11
+        ld a,(stawinid)
+        call SyDesktop_WINDIN
+        jp prgprz0
+
+scnent  dw 0
+scnpwd  dw 0
+scnzero db 0
+
+;==============================================================================
+;### ESP8266 TAB OF THE SETTINGS (firmware and certificate update) ############
+;==============================================================================
+cfgfwfn dw 0                    ;low byte Z firmware or Y certificates
+cfgfwh  db 0                    ;file handle
+cfgfwsz ds 4                    ;size of the file
+cfgfwbn dw 0                    ;bytes in cfgfwbuf
+cfgfwtk dw 0                    ;size in KB
+cfgfwbc dw 0                    ;blocks sent
+cfgdecp dw 0
+
+;### CFGMSG -> shows a text in the message line of the ESP8266 tab
+;### Input      HL=text (0 terminated, up to 47 characters)
+cfgmsg  ld de,cfgbufms
+cfgmsg1 ld a,(hl)
+        ld (de),a
+        inc hl
+        inc de
+        or a
+        jr nz,cfgmsg1
+cfgmsg2 ld a,(updwinid)
+        or a
+        jr nz,updtxt            ;the progress window is open, the text goes there
+        ld e,12
+        ld a,(cfgwinid)
+        jp SyDesktop_WINDIN
+
+;### CFGMSGX -> closes the progress window, shows a text and continues with the main loop
+cfgmsgx push hl
+        call cfgpwcls
+        pop hl
+        call cfgmsg
+        jp prgprz0
+
+;### CFGPWCLS -> closes the progress window if it is open
+cfgpwcls ld a,(updwinid)
+        or a
+        ret z
+        push af
+        xor a
+        ld (updwinid),a
+        pop af
+        jp SyDesktop_WINCLS
+
+;### CFGDRAIN -> throws away the messages the desktop sent while the update runs
+cfgdrain ld a,(App_PrcID)
+        db #dd:ld l,a
+        db #dd:ld h,PRC_ID_DESKTOP
+        ld iy,App_MsgBuf
+        rst #18
+        db #dd:dec l
+        jr z,cfgdrain
+        ret
+
+;### UPDTXT -> copies the message line into the progress window and redraws the text and the bar
+updtxt  ld hl,cfgbufms
+        ld de,updline2
+        ld b,30
+updtx1  ld a,(hl)
+        or a
+        jr z,updtx2
+        ld (de),a
+        inc hl
+        inc de
+        djnz updtx1
+        jr updtx4
+updtx2  ld a," "                ;fill the rest with spaces so that the old text is gone
+updtx3  ld (de),a
+        inc de
+        djnz updtx3
+updtx4  xor a
+        ld (de),a
+        call cfgdrain
+        ld a,(updwinid)
+        ld d,2
+        ld e,254                ;redraw the text and the bar
+        call SyDesktop_WINDIN
+        rst #30
+        call cfgdrain
+        ret
+
+;### CFGPWOP -> opens the progress window, A=title text address low part comes from (cfgfwfn)
+cfgpwop xor a
+        ld (cfgbarp+1),a
+        ld hl,updtit1
+        ld a,(cfgfwfn)
+        cp "Y"
+        jr nz,cfgpwo1
+        ld hl,updtit2
+cfgpwo1 ld (updwindat+30),hl
+        ld hl,updline2
+        ld b,30
+        ld a," "
+cfgpwo2 ld (hl),a
+        inc hl
+        djnz cfgpwo2
+        ld (hl),0
+        ld a,(App_BnkNum)
+        ld de,updwindat
+        call SyDesktop_WINOPN
+        jr c,cfgpwo3
+        ld (updwinid),a
+        ld a,(updwinid)
+        call SyDesktop_WINTOP
+cfgpwo3 ret
+
+;### CFGBAR -> sets the progress bar, HL=blocks sent, DE=blocks in total
+cfgbar  ld a,d
+        or a
+        jr z,cfgbar1
+        srl d
+        rr e
+        srl h
+        rr l
+        jr cfgbar
+cfgbar1 ld a,e
+        or a
+        jr nz,cfgbar2
+        inc e
+cfgbar2 ld a,h
+        or a
+        jr z,cfgbar3
+        ld l,255                ;more than the total, show a full bar
+cfgbar3 ld a,l
+        ld h,a
+        ld l,0
+        ld c,a
+        ld b,0
+        or a
+        sbc hl,bc               ;HL = sent * 255
+        ld d,0
+        ld b,0
+cfgbar4 or a
+        sbc hl,de
+        jr c,cfgbar5
+        inc b
+        jr nz,cfgbar4
+        dec b
+cfgbar5 ld a,b
+        ld (cfgbarp+1),a
+        ret
+
+;### CFGDEC -> adds the number in HL as decimal text at (cfgdecp), the pointer moves behind the text
+cfgdec  ld de,cfgdect
+        ld bc,-10000
+        call cfgdec1
+        ld bc,-1000
+        call cfgdec1
+        ld bc,-100
+        call cfgdec1
+        ld bc,-10
+        call cfgdec1
+        ld a,l
+        add "0"
+        ld (de),a
+        ld hl,cfgdect
+        ld bc,4*256+5           ;b=most leading zeros to skip, c=characters left
+cfgdec3 ld a,(hl)
+        cp "0"
+        jr nz,cfgdec4
+        inc hl
+        dec c
+        djnz cfgdec3
+cfgdec4 ld de,(cfgdecp)
+cfgdec5 ld a,(hl)
+        ld (de),a
+        inc hl
+        inc de
+        dec c
+        jr nz,cfgdec5
+        ld (cfgdecp),de
+        ret
+cfgdec1 ld a,"0"-1
+cfgdec2 inc a
+        add hl,bc
+        jr c,cfgdec2
+        sbc hl,bc
+        ld (de),a
+        inc de
+        ret
+
+;### CFGADD -> adds the text in HL at (cfgdecp), the pointer moves to the 0
+cfgadd  ld de,(cfgdecp)
+cfgadd1 ld a,(hl)
+        ld (de),a
+        or a
+        jr z,cfgadd2
+        inc hl
+        inc de
+        jr cfgadd1
+cfgadd2 ld (cfgdecp),de
+        ret
+
+;### CFGFWOP -> opens the update file
+;### Output     CF=1 error
+cfgfwop ld hl,cfgselp
+        ld a,(App_BnkNum)
+        db #dd:ld h,a
+        call SyFile_FILOPN
+        ret c
+        ld (cfgfwh),a
+        ret
+
+;### CFGFWRD -> reads the next 256 bytes of the update file into cfgfwbuf
+;### Output     CF=1 error, (cfgfwbn)=bytes read
+cfgfwrd ld hl,cfgfwbuf
+        ld bc,256
+        ld de,(App_BnkNum)
+        ld a,(cfgfwh)
+        call SyFile_FILINP
+        ret c
+        ld (cfgfwbn),bc
+        or a
+        ret
+
+;### CFGSEL -> file selector for the update file
+;### Output     CF=1 nothing selected, CF=0 the path is in cfgselp and shown in the file line
+cfgsel  ld hl,cfgselmz
+        ld a,(cfgfwfn)
+        cp "Y"
+        jr nz,cfgsel1
+        ld hl,cfgselmy
+cfgsel1 ld de,cfgselm
+        ld bc,4
+        ldir
+        xor a
+        ld (cfgselp),a
+        ld hl,cfgselm
+        ld a,(App_BnkNum)
+        ld c,8
+        ld ix,100
+        ld iy,5000
+        ld de,cfgwindat
+        call SySystem_SELOPN
+        cp 1
+        jr z,cfgsel9            ;cancelled
+        or a
+        jr z,cfgsel2
+        ld hl,cfgfwmf
+        call cfgmsg
+        jr cfgsel9
+cfgsel2 ld a,(cfgselp)
+        or a
+        jr z,cfgsel9
+        ld hl,cfgselp           ;show the name in the file line, the last 63 characters fit
+        ld de,cfgbufpa
+        ld b,63
+cfgsel3 ld a,(hl)
+        ld (de),a
+        or a
+        jr z,cfgsel4
+        inc hl
+        inc de
+        djnz cfgsel3
+        xor a
+        ld (de),a
+cfgsel4 ld e,9
+        ld a,(cfgwinid)
+        call SyDesktop_WINDIN
+        or a
+        ret
+cfgsel9 scf
+        ret
+
+;### CFGFWF / CFGFWC -> buttons Firmware and Certificates
+cfgfwf  ld a,"Z"
+        jr cfgfwu
+cfgfwc  ld a,"Y"
+cfgfwu  ld (cfgfwfn),a
+        call cfgsel             ;the file selector
+        jp c,prgprz0
+        call cfgfwop            ;*** first read of the file to get its size
+        ld hl,cfgfwm1
+        jp c,cfgmsgx
+        ld hl,0
+        ld (cfgfwsz),hl
+        ld (cfgfwsz+2),hl
+cfgfwu1 call cfgfwrd
+        jp c,cfgfwe2
+        ld bc,(cfgfwbn)
+        ld hl,(cfgfwsz)
+        add hl,bc
+        ld (cfgfwsz),hl
+        jr nc,cfgfwu2
+        ld hl,(cfgfwsz+2)
+        inc hl
+        ld (cfgfwsz+2),hl
+cfgfwu2 ld a,(cfgfwbn)
+        or a
+        jr nz,cfgfwu3           ;less than 256 bytes, that was the end
+        ld a,(cfgfwbn+1)
+        dec a
+        jr z,cfgfwu1
+cfgfwu3 ld a,(cfgfwh)
+        call SyFile_FILCLO
+        ld hl,(cfgfwsz)
+        ld a,h
+        or l
+        ld hl,(cfgfwsz+2)
+        or h
+        or l
+        ld hl,cfgfwm3
+        jp z,cfgmsgx
+        ld hl,(cfgfwsz)
+        ld (esp_fwsz),hl
+        ld hl,(cfgfwsz+2)
+        ld (esp_fwsz+2),hl
+        ld a,(cfgfwsz+1)        ;size in KB, (size / 1024) + 1
+        srl a
+        srl a
+        ld l,a
+        ld h,0
+        ld a,(cfgfwsz+2)
+        ld c,a
+        ld b,0
+        sla c
+        rl b
+        sla c
+        rl b
+        sla c
+        rl b
+        sla c
+        rl b
+        sla c
+        rl b
+        sla c
+        rl b
+        add hl,bc
+        inc hl
+        ld (cfgfwtk),hl
+        call cfgfwop            ;*** second read, now the data goes to the ESP
+        ld hl,cfgfwm1
+        jp c,cfgmsgx
+        call cfgfwrd
+        jp c,cfgfwe2
+        ld hl,cfgfwbuf          ;the first 4 bytes tell the ESP what kind of file this is
+        ld de,esp_fwbuf
+        ld bc,4
+        ldir
+        call cfgpwop
+        ld hl,cfgfwm4
+        call cfgmsg
+        ld a,(cfgfwfn)
+        call espfwbg
+        or a
+        jr z,cfgfwu4
+        ld hl,cfgfwm5
+        dec a
+        jp z,cfgfwe3
+        ld hl,cfgfwm6
+        jp cfgfwe3
+cfgfwu4 ld hl,0
+        ld (cfgfwbc),hl
+cfgfwl1 ld hl,cfgfwbuf          ;*** send the blocks
+        ld de,esp_fwbuf
+        ld bc,256
+        ldir
+        ld hl,(cfgfwbn)
+        call espfwbk
+        or a
+        jp nz,cfgfwe5           ;a block went wrong, the ESP can only be reset by power
+        ld hl,(cfgfwbc)
+        inc hl
+        ld (cfgfwbc),hl
+        ld a,l
+        and 7
+        call z,cfgfwpr          ;show the progress every 8 blocks
+        call cfgfwrd
+        jp c,cfgfwe5
+        ld a,(cfgfwbn)
+        ld hl,cfgfwbn+1
+        or (hl)
+        jr nz,cfgfwl1
+        ld a,(cfgfwh)
+        call SyFile_FILCLO
+        ld hl,cfgfwm8
+        call cfgmsg
+        call espfwen
+        or a
+        jr z,cfgfwu5
+        ld hl,cfgfwm5
+        dec a
+        jp z,cfgfwe6
+        ld hl,cfgfwm6
+        jp cfgfwe6
+cfgfwu5 ld a,(cfgfwfn)
+        cp "Y"
+        jr nz,cfgfwu6
+        ld hl,cfgfwmb
+        call cfgmsg
+        call espcrt
+        or a
+        jp nz,cfgfwe4           ;no certificate index
+cfgfwu6 call cfgpwcls
+        xor a
+        call lowini             ;find the ESP again, reads the version and the access point
+        ld a,1
+        call netini0
+        ld a,1
+        ld (netipsc),a
+        ld e,5
+        ld a,(cfgwinid)
+        call SyDesktop_WINDIN   ;new version
+        ld hl,cfgbufms
+        ld (cfgdecp),hl
+        ld a,(cfgfwfn)
+        cp "Y"
+        ld hl,cfgfwmc
+        jr z,cfgfwu7
+        ld hl,cfgfwm9
+        call cfgadd
+        ld hl,cfgtxtver
+cfgfwu7 call cfgadd
+        call cfgmsg2
+        jp prgprz0
+cfgfwe2 ld a,(cfgfwh)           ;*** errors
+        call SyFile_FILCLO
+        ld hl,cfgfwm2
+        jp cfgmsgx
+cfgfwe3 push hl
+        ld a,(cfgfwh)
+        call SyFile_FILCLO
+        pop hl
+        jp cfgmsgx
+cfgfwe5 ld a,(cfgfwh)
+        call SyFile_FILCLO
+cfgfwe4 ld hl,cfgfwma
+        jp cfgmsgx
+cfgfwe6 jp cfgmsgx
+
+;### CFGFWPR -> shows "Sent n of m KB"
+cfgfwpr ld hl,(cfgfwbc)
+        ld de,(cfgfwsz+1)
+        inc de
+        call cfgbar             ;the bar
+        ld hl,cfgbufms
+        ld (cfgdecp),hl
+        ld hl,cfgfwm7
+        call cfgadd
+        ld hl,(cfgfwbc)
+        srl h
+        rr l
+        srl h
+        rr l                    ;blocks / 4 = KB
+        call cfgdec
+        ld hl,cfgfwmd
+        call cfgadd
+        ld hl,(cfgfwtk)
+        call cfgdec
+        ld hl,cfgfwme
+        call cfgadd
+        jp cfgmsg2
 endif
 
 
@@ -967,6 +1605,9 @@ cfgipr2 push bc
 
 ;### CFGTAB -> changes config window tab
 cfgtabadr   dw cfgwingrpa,cfgwingrpb
+if DRIVER=6
+            dw cfgwingrpc
+endif
 cfgtabact   db 0
 cfgtab  ld a,(cfgctltba0)
         ld hl,cfgtabact
@@ -1206,6 +1847,10 @@ netips  ld hl,netipsc
         dec (hl)
         ret nz
         ld (hl),250             ;retry about every 5 seconds
+        call espap              ;the ESP blocks up to 10 seconds per IP command while it is not connected
+        ld a,(esp_apst)
+        cp 5
+        ret nz                  ;so the IP data is only asked when the access point state is connected
         call espips             ;fills net_ipaadr (ip,mask,gateway) and net_dnspri
         ret c
         ld hl,net_ipaadr        ;0.0.0.0 -> WiFi not connected yet
@@ -1482,7 +2127,13 @@ netpol3 dec a                       ;*** STATUS CHECK
 ;### NETTCP -> manages TCP socket
 ;### Input      C=socket ID, IX=socket data
 nettcps db 0,0          ;old status
+if DRIVER=6
+nettcpsck db 0                  ;socket of the event that is built
 nettcp  ld a,c
+        ld (nettcpsck),a
+else
+nettcp  ld a,c
+endif
         call lowtst             ;A=status, BC=received bytes, IX,IY=remote IP, DE=remote port
         or a
         jr z,netpol0                ;in process -> skip
@@ -1499,6 +2150,12 @@ nettcp1 ld (nettcps),hl
         ld (ix+sckdatsta+0),a       ;store new status
         ld (ix+sckdatrcv+0),c       ;store received bytes
         ld (ix+sckdatrcv+1),b
+if DRIVER=6
+        push af
+        ld a,(esp_lastreason)
+        ld (ix+sckdatrsv),a         ;store the close reason
+        pop af
+endif
         ld (ix+sckdatrpo+0),e       ;store remote port
         ld (ix+sckdatrpo+1),d
         ld (ix+sckdatrip+0),l       ;store remote IP
@@ -1530,16 +2187,27 @@ nettcp2 res 7,l                 ;send "connection status" event
         call nettcp3
         jr netpol0
 ;l=status
+if DRIVER=6
+nettcp3 ld a,(esp_lastreason)
+        ld h,a                  ;the close reason travels in the H byte of the event
+        ld a,(nettcpsck)
+        or a
+        call netmsg1:db MSR_NET_TCPEVT
+        ret
+else
 nettcp3 ld a,(netpols+1)
         or a
         call netmsg1:db MSR_NET_TCPEVT
         ret
+endif
 
 ;### NETUDP -> manages UDP socket
 ;### Input      C=socket ID, IX=socket data
 if DRIVER=6
 netudps db 0,0          ;old status
+netudpsck db 0
 netudp  ld a,c
+        ld (netudpsck),a
         call lowust             ;A=status, BC=received bytes, IX,IY=remote IP, DE=remote port
         or a
         jp z,netpol0                ;in process -> skip
@@ -1587,7 +2255,7 @@ netudp2 res 7,l                 ;send "connection status" event
         call netudp3
         jp netpol0
 ;l=status
-netudp3 ld a,(netpols+1)
+netudp3 ld a,(netudpsck)
         or a
         call netmsg1:db MSR_NET_UDPEVT
         ret
@@ -1605,6 +2273,11 @@ netdns  ld a,(ix+sckdatsta)
         ld a,(hl)
         or a
         jp nz,netpol0               ;another request is still proceeded -> keep it waiting
+if DRIVER=6
+        ld a,(esp_pend)             ;the ESP is busy with a long request -> keep it waiting
+        or a
+        jp nz,netpol0
+endif
         ld (hl),1
         ld (ix+sckdatsta),sckstadpr
         ld a,(App_BnkNum)
@@ -1724,6 +2397,7 @@ netres1 ld a,(hl)
         pop bc
 netres2 ld de,sckdatlen
         add hl,de
+        inc c                   ;next socket
         djnz netres1
         xor a
         ld (dnslupflg),a
@@ -1820,6 +2494,117 @@ sckdec  push hl
 ;### Output     CF=0 ok,    (netscknum)=socket
 ;###            CF=1 error, A=error code
 ;### Destroyed  BC,DE,HL,IX,IY
+if DRIVER=6
+;  Input  A bit 0=server, bit 1=reserved (must be 0), bit 2=TLS, bit 3=verify certificate and host name,
+;         bits 4-7=bank of the host name, BC=zero terminated host name for TLS (SNI), 0 for plain TCP
+tcpopns ds 10                   ;local port, remote IP, remote port, flags, host length
+tcpopnf db 0                    ;the mode bits as given
+tcphbnk db 0                    ;bank of the host name
+tcpopn  ld (tcpopnf),a
+        ld a,(esp_pend)         ;a long request is outstanding, refuse before a socket is taken
+        or a
+        ld a,neterrcon
+        scf
+        ret nz
+        call netprt
+        ld (tcpopns+0),hl
+        ld (tcpopns+2),ix
+        ld (tcpopns+4),iy
+        ld (tcpopns+6),de
+        ld a,(tcpopnf)
+        and #0f
+        ld (tcpopns+8),a        ;mode flags for the ESP
+        xor a
+        ld (tcpopns+9),a        ;no host name
+        ld a,(tcpopnf)
+        rrca
+        rrca
+        rrca
+        rrca
+        and #0f
+        ld (tcphbnk),a
+        ld a,(tcpopns+8)
+        bit 1,a
+        jr nz,tcpopn8           ;reserved bit set
+        bit 0,a
+        jr z,tcpopnc
+        bit 2,a
+        jr nz,tcpopn8           ;TLS server is not possible
+        jr tcpopn9
+tcpopnc bit 2,a
+        jr z,tcpopn9            ;plain TCP client, no host name
+        ld a,b
+        or c
+        jr z,tcpopn7            ;TLS without a host name
+        ld a,(App_BnkNum)
+        add a:add a:add a:add a
+        ld hl,tcphbnk
+        add (hl)                ;A=(dest<<4)+src, dest=own bank, src=caller bank
+        ld h,b
+        ld l,c
+        ld de,esp_fwbuf
+        ld bc,256
+        rst #20:dw jmp_bnkcop
+        ld hl,esp_fwbuf
+        ld a,(hl)
+        or a
+        jr z,tcpopn7            ;empty name
+        ld b,255
+tcpopnh1 ld a,(hl)
+        or a
+        jr z,tcpopnh2
+        inc hl
+        djnz tcpopnh1
+        jr tcpopn7              ;no terminator within 255 bytes
+tcpopnh2 ld de,esp_fwbuf
+        or a
+        sbc hl,de
+        inc hl                  ;length including the terminator
+        ld a,l
+        ld (tcpopns+9),a
+        jr tcpopn9
+tcpopn7 ld a,neterrhst
+        scf
+        ret
+tcpopn8 ld a,neterrfnc
+        scf
+        ret
+tcpopn9 ld a,scktyptcp
+        call scknew
+        ret c
+        ld (netscknum),a
+        ld (iy+sckdatrsv),0     ;no close reason yet
+        ld c,a                  ;c=socket
+        ld hl,(tcpopns+0)
+        ld (iy+sckdatlpo+0),l
+        ld (iy+sckdatlpo+1),h
+        ld a,(tcpopns+8)
+        bit 0,a
+        jr nz,tcpopn2
+        ld hl,(tcpopns+2)       ;** client
+        ld (iy+sckdatrip+0),l
+        ld (iy+sckdatrip+1),h
+        ld hl,(tcpopns+4)
+        ld (iy+sckdatrip+2),l
+        ld (iy+sckdatrip+3),h
+        ld hl,(tcpopns+6)
+        ld (iy+sckdatrpo+0),l
+        ld (iy+sckdatrpo+1),h
+        ld de,256*sckstatop+0
+tcpopn1 ld (iy+sckdatsta),d
+        ld ix,tcpopns
+        ld a,c
+        push iy
+        call lowtop             ;a=socket, e=0 client or 1 server, ix=parameter block
+        pop iy
+        ret nc
+        ld (iy+sckdattyp),scktypfre     ;the ESP refused it, give the socket back
+        call sckdec
+        scf
+        ret
+tcpopn2 ld de,256*sckstatli+1           ;** server
+        jr tcpopn1
+else
 tcpopns ds 8
 tcpopn  push af
         call netprt
@@ -1858,6 +2643,7 @@ tcpopn1 ld (iy+sckdatsta),d
         ret
 tcpopn2 ld de,256*sckstatli+1           ;** server
         jr tcpopn1
+endif
 
 ;### TCPCLO -> TCP close connection
 ;### Input      A=socket
@@ -1867,11 +2653,22 @@ tcpopn2 ld de,256*sckstatli+1           ;** server
 tcpclo  ld c,scktyptcp
         call sckget
         ret c
+if DRIVER=6
+        push iy
+        call lowtcl             ;the driver first, when it is busy the socket stays
+        pop iy
+        ret c
+        ld (iy+sckdattyp),scktypfre
+        call sckdec
+        xor a
+        ret
+else
         ld (iy+sckdattyp),scktypfre
         call sckdec
         call lowtcl
         or a
         ret
+endif
 
 ;### TCPRCV -> TCP receive from connection
 ;### Input      A=socket, BC=length, E,HL=memory
@@ -1905,6 +2702,9 @@ tcprcv1 pop hl
         ld a,d
 tcprcv2 call lowtrx
         pop iy
+if DRIVER=6
+        jr c,tcprcvb            ;the driver is busy with a long request, nothing delivered
+endif
         ld l,c
         ld h,b
         pop bc
@@ -1918,6 +2718,14 @@ tcprcv3 ld a,l
 tcprcv4 ld l,(iy+sckdatrcv+0)
         ld h,(iy+sckdatrcv+1)
         jr tcprcv3
+if DRIVER=6
+tcprcvb pop bc                  ;forget the requested size
+        ld l,(iy+sckdatrcv+0)
+        ld h,(iy+sckdatrcv+1)   ;the data is still waiting
+        ld bc,0
+        or a
+        ret
+endif
 
 ;### TCPSND -> TCP send to connection
 ;### Input      A=socket, BC=length, E,HL=memory
@@ -1951,11 +2759,22 @@ tcpsnd  push bc
 tcpdis  ld c,scktyptcp
         call sckget
         ret c
+if DRIVER=6
+        push iy
+        call lowtdc             ;the driver first, when it is busy the socket stays
+        pop iy
+        ret c
+        ld (iy+sckdattyp),scktypfre
+        call sckdec
+        xor a
+        ret
+else
         ld (iy+sckdattyp),scktypfre
         call sckdec
         call lowtdc
         or a
         ret
+endif
 
 ;### TCPSTA -> TCP status of connection
 ;### Input      A=socket
@@ -1976,6 +2795,9 @@ tcpsta  ld c,scktyptcp
         ld h,(iy+sckdatrip+3)
         push hl
         ld l,(iy+sckdatsta)
+if DRIVER=6
+        ld h,(iy+sckdatrsv)     ;the close reason
+endif
         pop iy
         pop ix
         or a
@@ -2014,6 +2836,11 @@ tcpfls  call sckget
 ;### Destroyed  BC,DE,HL,IX,IY
 udpopn
 if DRIVER=6
+        ld a,(esp_pend)         ;a long request is outstanding, refuse before a socket is taken
+        or a
+        ld a,neterrcon
+        scf
+        ret nz
         push de                 ;e=bank
         call netprt
         ld a,scktypudp
@@ -2056,11 +2883,22 @@ endif
 udpclo  ld c,scktypudp
         call sckget
         ret c
+if DRIVER=6
+        push iy
+        call lowucl             ;the driver first, when it is busy the socket stays
+        pop iy
+        ret c
+        ld (iy+sckdattyp),scktypfre
+        call sckdec
+        xor a
+        ret
+else
         ld (iy+sckdattyp),scktypfre
         call sckdec
         call lowucl
         or a
         ret
+endif
 
 ;### UDPSTA -> UDP status of session
 ;### Input      A=socket
@@ -2099,23 +2937,27 @@ endif
 ;### Destroyed  BC,DE,HL,IX,IY
 udprcv
 if DRIVER=6
+        push bc                 ;maximum length of the caller, 0 = the whole datagram
         push hl                 ;destination
         ld c,scktypudp
         call sckget             ;iy=record, a=socket
         pop hl
+        pop bc
         ret c
         bit 7,(iy+sckdatsta)    ;ZF=1 means nothing is waiting
         ld d,a                  ;d=socket
         ld a,neterrtes
         scf
         ret z
+        ld e,(iy+sckdatbnk)
+        push bc
         ld c,(iy+sckdatrcv+0)
         ld b,(iy+sckdatrcv+1)
-        ld e,(iy+sckdatbnk)
-        call netdin
+        call netdin             ;the statistics count the complete datagram
+        pop bc
         push iy
         ld a,d
-        call lowurx             ;a=socket, bc=length, e=bank, hl=destination
+        call lowurx             ;a=socket, bc=maximum, e=bank, hl=destination, returns bc=copied
         pop iy
         ld (iy+sckdatrcv+0),0
         ld (iy+sckdatrcv+1),0
@@ -3456,6 +4298,53 @@ statxttxx   db "Key",0
 statxttxy   db "Show",0
 statxttxz   db "Connect",0
 statxttza   db "Cable plugged",0
+if DRIVER=6
+statxttba4  db "Scan",0
+scntxfr     db "WiFi networks",0
+scntxbs     db "Scan",0
+scntxbc     db "Connect",0
+scntxbd     db "Disconnect",0
+scntxpt     db "Password",0
+scntxsh     db "Show password",0
+scntxnl     db "(no networks)",0
+scntxsc     db "Scanning...",0
+scntxno     db "No networks found",0
+scntxfl     db "No answer from the ESP",0
+scntxfd     db " networks found",0
+scntxse     db "Press Scan first",0
+scntxpw     db "Enter the password",0
+scntxcn     db "Connecting...",0
+scntxok     db "Connected",0
+scntxnc     db "Could not connect",0
+scntxdi     db "Disconnected",0
+cfgtxttba3  db "ESP8266",0
+cfgtxtvr    db "ESP firmware version",0
+cfgtxttls   db "Check HTTPS server certificates",0
+cfgtxtfrf   db "Update from a file",0
+cfgtxtfl    db "File",0
+cfgtxtbf    db "Firmware...",0
+cfgtxtbc    db "Certificates...",0
+cfgtxthn    db "The buttons ask for the file",0
+cfgfwmf     db "Cannot open the file selector",0
+cfgselmz    db "BIN",0
+cfgselmy    db "BIN",0
+updtit1     db "Updating the ESP firmware",0
+updtit2     db "Updating the ESP certificates",0
+cfgfwm1     db "Cannot open the file",0
+cfgfwm2     db "Cannot read the file",0
+cfgfwm3     db "The file is empty",0
+cfgfwm4     db "Starting, do not power off",0
+cfgfwm5     db "The ESP refused this file",0
+cfgfwm6     db "No answer from the ESP",0
+cfgfwm7     db "Sent ",0
+cfgfwm8     db "Writing, wait a minute",0
+cfgfwm9     db "Done, firmware version ",0
+cfgfwma     db "Failed, switch the MSX off and on",0
+cfgfwmb     db "Building the certificate index",0
+cfgfwmc     db "Certificates updated",0
+cfgfwmd     db " of ",0
+cfgfwme     db " KB",0
+endif
 
 ;### config dialogue text data
 cfgtxttxe   db ".",0
@@ -3490,6 +4379,20 @@ stabufim5   ds 1+2
 if M4BOARD=1
 stabufia0   ds 1+32 ;ssid/password
 stabufia1   ds 1+65
+endif
+if DRIVER=6
+scnbufpw    ds 1+65     ;password
+scnbufms    db "Press Scan to find networks",0
+            ds 20
+cfgbufpa    ds 64       ;path of the update file
+cfgbufms    ds 48       ;message line of the ESP8266 tab
+cfgtxtver   db "?",0
+            ds 6
+cfgdect     ds 5
+cfgfwbuf    ds 256      ;block read from the file
+updwinid    db 0        ;progress window, 0 = not open
+updline1    db "Do not switch off the MSX",0
+updline2    ds 31
 endif
 
 ;==============================================================================
@@ -3526,6 +4429,10 @@ elseif M4BOARD=1
 stawingrpc  db 25,0:dw stawindatc,0,0,4*256+3,0,0,2
 elseif DRIVER=4
 stawingrpc  db 30,0:dw stawindatc,0,0,4*256+3,0,0,2
+endif
+
+if DRIVER=6
+stawingrpd  db 14,0:dw stawindatd,0,0,4*256+3,0,0,2
 endif
 
 stamendat   dw 2, 1+4,stamentxt1,stamendat1,0,     1+4,stamentxt2,stamendat2,0
@@ -3752,6 +4659,25 @@ dw staapl,  255*256+16, statxtbtc,   109,    85,    36,    12, 0    ;button appl
 
 endif
 
+if DRIVER=6
+stawindatd                                                              ;*** SCAN
+; onclick         type   property   xpos   ypos   xlen   ylen
+dw      0,  255*256+ 0,         2,     0,     0, 10000, 10000, 0    ;0 background
+dw statab,  255*256+20, stactltba,     0,     2,   205,    11, 0    ;1 tab
+dw stahid,  255*256+16, statxtbta,     3,   107,    56,    12, 0    ;2 button hide
+dw stacfg,  255*256+16, statxtbtb,    65,   107,    87,    12, 0    ;3 button settings
+dw      0,  255*256+ 3, scnctlfr,      0,    16,   155,    90, 0    ;4 frame
+dw      0,  255*256+ 1, stactltxr,    10,    26,   140,     8, 0    ;5 WiFi access point
+dw      0,  255*256+42, scnctlcb,     10,    37,   135,    10, 0    ;6 list of networks
+dw scnscan, 255*256+16, scntxbs,     10,    52,    36,    12, 0    ;7 button scan
+dw scnconn, 255*256+16, scntxbc,     49,    52,    44,    12, 0    ;8 button connect
+dw scndisc, 255*256+16, scntxbd,     96,    52,    49,    12, 0    ;9 button disconnect
+dw      0,  255*256+ 1, scnctlpt,     10,    69,    38,     8, 0    ;10 description password
+dw      0,  255*256+32, scnctlpw,     50,    67,    95,    12, 0    ;11 password input
+dw scnpws,  255*256+17, scnctlsh,     50,    81,    95,     8, 0    ;12 show password
+dw      0,  255*256+ 1, scnctlms,     10,    94,   140,     8, 0    ;13 message
+endif
+
 
 stactlpsl   dw 04,0,stalstpsl,0,1,starowpsl,0,1
 starowpsl   dw 0,17,0,0
@@ -3769,6 +4695,9 @@ cfgwindat0  dw cfgwingrpa,0,0:ds 136+14
 
 cfgwingrpa  db 35,0:dw cfgwindata,0,0,4*256+3,0,0,2
 cfgwingrpb  db 25,0:dw cfgwindatb,0,0,4*256+3,0,0,2
+if DRIVER=6
+cfgwingrpc  db 14,0:dw cfgwindatc,0,0,4*256+3,0,0,2
+endif
 
 cfgwindata
 ; onclick         type   property   xpos   ypos   xlen   ylen
@@ -3836,9 +4765,35 @@ dw      0,  255*256+32, cfgctlie2,   132,   101,    20,    12, 0    ;input IPe-2
 dw      0,  255*256+ 1, cfgctltxe,   153,   103,     5,     8, 0    ;dot
 dw      0,  255*256+32, cfgctlie3,   155,   101,    20,    12, 0    ;input IPe-3
 
+if DRIVER=6
+cfgwindatc                                                              ;*** ESP8266
+; onclick         type   property   xpos   ypos   xlen   ylen
+dw      0,  255*256+ 0,         2,     0,     0, 10000, 10000, 0    ;0 background
+dw cfgtab,  255*256+20, cfgctltba,     0,     2,   205,    11, 0    ;1 tab
+dw cfgoky,  255*256+16, prgtxtoky,    99,   140,    50,    12, 0    ;2 button ok
+dw cfgcnc,  255*256+16, prgtxtcnc,   152,   140,    50,    12, 0    ;3 button cancel
+dw      0,  255*256+ 1, cfgctlvr,     10,    20,    90,     8, 0    ;4 description firmware version
+dw      0,  255*256+ 1, cfgctlvt,    104,    20,    60,     8, 0    ;5 firmware version
+dw      0,  255*256+17, cfgctltl,     10,    34,   185,     8, 0    ;6 check the certificates
+dw      0,  255*256+ 3, cfgctlff,      0,    50,   205,    84, 0    ;7 frame
+dw      0,  255*256+ 1, cfgctlfl,     10,    62,    20,     8, 0    ;8 description file
+dw      0,  255*256+32, cfgctlpa,     32,    60,   163,    12, 0    ;9 path of the file
+dw cfgfwf,  255*256+16, cfgtxtbf,     10,    78,    90,    12, 0    ;10 button firmware
+dw cfgfwc,  255*256+16, cfgtxtbc,    105,    78,    90,    12, 0    ;11 button certificates
+dw      0,  255*256+ 1, cfgctlms,     10,    96,   185,     8, 0    ;12 message
+dw      0,  255*256+ 1, cfgctlhn,     10,   108,   185,     8, 0    ;13 hint
+endif
+
 ;### config dialogue control data
+if DRIVER=6
+cfgctltba   db 3,2+4+48+64
+else
 cfgctltba   db 2,2+4+48+64
+endif
 cfgctltba0  db 0:dw cfgtxttba1:db -1:dw cfgtxttba2:db -1
+if DRIVER=6
+            dw cfgtxttba3:db -1
+endif
 
 cfgctltxa   dw cfgtxttxa,2+4
 cfgctltxb   dw cfgtxttxb,2+4
@@ -3892,8 +4847,15 @@ cfgerrmsg   dw cfgerrtxt0,4*1+2,cfgerrtxt1,4*1+2,cfgerrtxt2,4*1+2
 
 
 ;### status control data
+if DRIVER=6
+stactltba   db 4,2+4+48+64
+else
 stactltba   db 3,2+4+48+64
+endif
 stactltba0  db 0:dw statxttba1:db -1:dw statxttba2:db -1:dw statxttba3:db -1
+if DRIVER=6
+            dw statxttba4:db -1
+endif
 
 stactlfra   dw statxtfra,2+4
 stactlfrb   dw statxtfrb,2+4
@@ -3958,4 +4920,41 @@ stactlia1   dw stabufia1,0,0,0,0,64:stactlia1p db 1
 
 stactlshs   db 0
 stactlshc   dw stactlshs,statxttxy,256*0+2+4
+endif
+if DRIVER=6
+scnctlfr    dw scntxfr,2+4
+scnctlpt    dw scntxpt,2+4
+scnctlms    dw scnbufms,2+4
+scnctlpw    dw scnbufpw,0,0,0,0,64
+scnctlpwp   db 1
+scnshs      db 0
+scnctlsh    dw scnshs,scntxsh,256*0+2+4
+scnctlcb    dw 1,0,scnlstcb,0,1,scnrowcb,0,1
+scnrowcb    dw 0,135,0,0
+scnlstcb    dw 0,scntxnl
+            ds 9*4                      ;room for 10 lines in total, esp_scmax in the driver
+cfgctlvr    dw cfgtxtvr,2+4
+cfgctlvt    dw cfgtxtver,2+4
+cfgctltl    dw cfg_tlsver,cfgtxttls,256*0+2+4
+cfgctlff    dw cfgtxtfrf,2+4
+cfgctlfl    dw cfgtxtfl,2+4
+cfgctlpa    dw cfgbufpa,0,0,0,0,63
+            db 0
+cfgctlms    dw cfgbufms,2+4
+cfgctlhn    dw cfgtxthn,2+4
+
+cfgselm     db "BIN",0          ;mask and result of the file selector, the path starts at offset 4
+cfgselp     ds 256
+
+updwindat   dw #1101,0,70,70,175,50,0,0,175,50,175,50,175,50,prgicnsml,updtit1,0,0
+updwindat0  dw updgrp,0,0:ds 136+14
+updgrp      db 4,0:dw updctrl,0,0,0,0,0,0
+updctrl
+dw      0,  255*256+ 0,         2,     0,     0, 10000, 10000, 0    ;0 background
+dw      0,  255*256+ 1, updctl1,      8,     6,   160,     8, 0    ;1 text, do not switch off
+dw      0,  255*256+ 1, updctl2,      8,    18,   160,     8, 0    ;2 text, what happens now
+dw      0,  255*256+ 4, cfgbarp,      8,    32,   160,    10, 0    ;3 progress bar
+updctl1     dw updline1,2+4
+updctl2     dw updline2,2+4
+cfgbarp     dw #36
 endif
